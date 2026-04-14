@@ -22,6 +22,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { createServer as createNetServer, type Socket } from 'net'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -640,11 +641,70 @@ function shutdown(): void {
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
+  try { hookServer.close() } catch {}
+  try { rmSync(HOOK_SOCK) } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
+
+// ---- Phase 0: hook-event forwarder socket ----
+//
+// A tiny shim script (`hooks/forward-to-plugin.sh` in the personal-agent repo)
+// is wired into every Claude Code hook trigger. On fire it connects here,
+// writes one newline-framed JSON frame { mode, hook, session_id, ts }, and
+// either closes (fire-and-forget) or reads a decision line back (sync mode
+// for Stop / PreToolUse). Phase 1+ extend handleHookFrame to actually act.
+const HOOK_SOCK = join(STATE_DIR, 'events.sock')
+const SYNC_HOOK_MODES = new Set(['Stop', 'PreToolUse'])
+
+try { rmSync(HOOK_SOCK) } catch {}
+
+interface HookFrame {
+  mode?: string
+  hook?: Record<string, unknown>
+  session_id?: string
+  ts?: string
+}
+
+function handleHookFrame(frame: HookFrame, conn: Socket): void {
+  const mode = frame.mode ?? ''
+  if (process.env.TELEGRAM_HOOK_DEBUG) {
+    process.stderr.write(`telegram channel: hook ${mode} session=${frame.session_id ?? '-'}\n`)
+  }
+  // Phase 0: no real handlers yet. Sync modes must still receive a decision
+  // line so the shim exits promptly; empty JSON = Claude Code default (allow).
+  if (SYNC_HOOK_MODES.has(mode)) {
+    try { conn.write('{}\n') } catch {}
+  }
+}
+
+const hookServer = createNetServer((conn: Socket) => {
+  let buf = ''
+  conn.on('data', (chunk) => {
+    buf += chunk.toString('utf8')
+    let nl: number
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl)
+      buf = buf.slice(nl + 1)
+      if (!line.trim()) continue
+      let frame: HookFrame
+      try { frame = JSON.parse(line) } catch { continue }
+      handleHookFrame(frame, conn)
+    }
+  })
+  conn.on('error', () => { /* swallow — never crash the listener */ })
+})
+
+hookServer.on('error', (e) => {
+  process.stderr.write(`telegram channel: hook socket error ${String(e)}\n`)
+})
+
+hookServer.listen(HOOK_SOCK, () => {
+  try { chmodSync(HOOK_SOCK, 0o600) } catch {}
+  process.stderr.write(`telegram channel: hook socket listening at ${HOOK_SOCK}\n`)
+})
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
